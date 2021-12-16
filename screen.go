@@ -3,11 +3,9 @@ package screen
 import (
 	"context"
 	"errors"
-	"log"
 	"os"
 	"os/exec"
 	"os/user"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -59,8 +57,8 @@ func New(ctx context.Context, name string) (s Screen, err error) {
 	}
 
 	// Prematurely create/get and lock mutex
-	m, _ := mutexes.LoadOrStore(name, sync.Mutex{})
-	mutex, _ := m.(sync.Mutex)
+	m, _ := mutexes.LoadOrStore(name, new(sync.Mutex))
+	mutex, _ := m.(*sync.Mutex)
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -124,9 +122,9 @@ func Get(name string) (s Screen, err error) {
 	}
 
 	// Load mutex from global map.
-	m, _ := mutexes.LoadOrStore(name, sync.Mutex{})
-	mutex, _ := m.(sync.Mutex)
-	s.Mutex = &mutex
+	m, _ := mutexes.LoadOrStore(name, new(sync.Mutex))
+	mutex, _ := m.(*sync.Mutex)
+	s.Mutex = mutex
 
 	return
 }
@@ -150,9 +148,9 @@ func GetAll() (res []Screen) {
 		s.Name = nameAndPID[1]
 
 		// Load mutex from global map.
-		m, _ := mutexes.LoadOrStore(s.Name, sync.Mutex{})
-		mutex, _ := m.(sync.Mutex)
-		s.Mutex = &mutex
+		m, _ := mutexes.LoadOrStore(s.Name, new(sync.Mutex))
+		mutex, _ := m.(*sync.Mutex)
+		s.Mutex = mutex
 
 		res = append(res, s)
 	}
@@ -233,8 +231,9 @@ func (s Screen) Exec(fdpat string, command string, args ...string) error {
 	}
 
 	// Check fdpat
-	match, err := regexp.MatchString("/[.!:]{0,3}\\|?$", fdpat)
-	if err != nil {
+	if fdpat == "" {
+		fdpat = ":::"
+	} else if match, err := regexp.MatchString("/[.!:]{0,3}\\|?$", fdpat); err != nil {
 		return err
 	} else if !match {
 		return &os.SyscallError{Syscall: os.ErrInvalid.Error(), Err: errors.New("invalid fdpat")}
@@ -397,7 +396,6 @@ func (s Screen) StuffReturnGetOutput(ctx context.Context, commands ...string) (s
 	if err != nil {
 		return "", err
 	}
-	log.Println(f.Name())
 	time.Sleep(time.Second * 2)
 
 	// Run command
@@ -432,11 +430,6 @@ func (s Screen) StuffReturnGetOutput(ctx context.Context, commands ...string) (s
 
 // isOnline is a quick helper function to check if a screen is still currently running.
 func (s Screen) isOnline() bool {
-	matches, _ := filepath.Glob(filepath.Join(screenDir, "S-"+username, "[0-9]*."+s.Name))
-	log.Println(matches)
-	if len(matches) != 0 {
-		return true
-	}
-	s.Process = nil
-	return false
+	_, err := New(context.Background(), s.Name)
+	return err == nil
 }
