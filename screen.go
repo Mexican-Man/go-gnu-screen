@@ -308,7 +308,7 @@ func (s Screen) Clear() error {
 // ================== Custom functions =====================
 // =========================================================
 
-// Signal all subprocesses of the screen.
+// Signal all subprocesses of the screen, and the screen itself.
 func (s Screen) Signal(signal syscall.Signal) error {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
