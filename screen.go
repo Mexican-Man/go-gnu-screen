@@ -131,6 +131,35 @@ func Get(name string) (s Screen, err error) {
 	return
 }
 
+// GetAll returns all existing screens.
+func GetAll() (res []Screen) {
+	out, _ := exec.Command("screen", "-ls", "mcscreen-").CombinedOutput() // Run screen list
+	if strings.Contains(string(out), "No Sockets found in") {
+		return nil
+	}
+
+	parsed := strings.Split(string(out), "\n")
+	for i := 1; i < len(parsed)-1; i++ { // We want to skip first and last lines
+		subject := strings.Fields(parsed[i])[0]   // First part will be "<PID>.mcscreen-<name>"
+		nameAndPID := strings.Split(subject, ".") // Dissect
+
+		var s Screen
+		if i, err := strconv.Atoi(nameAndPID[0]); err == nil {
+			s.Process, _ = os.FindProcess(i)
+		}
+		s.Name = nameAndPID[1]
+
+		// Load mutex from global map.
+		m, _ := mutexes.LoadOrStore(s.Name, sync.Mutex{})
+		mutex, _ := m.(sync.Mutex)
+		s.Mutex = &mutex
+
+		res = append(res, s)
+	}
+
+	return
+}
+
 // =========================================================
 // ================== Builtin functions ====================
 // =========================================================
