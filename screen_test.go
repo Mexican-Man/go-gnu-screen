@@ -7,7 +7,7 @@ import (
 )
 
 func TestNew(t *testing.T) {
-	s, err := New(context.Background(), "banana")
+	s, err := New(context.Background(), "banana", "sh")
 	if err != nil {
 		t.Error(err)
 	}

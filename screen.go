@@ -3,6 +3,7 @@ package screen
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/user"
@@ -49,53 +50,38 @@ func init() {
 	username = u.Username
 }
 
-// New will create a screen with the given name. It waits until the system starts the screen, then returns.
-func New(ctx context.Context, name string) (s Screen, err error) {
+// New will create a screen with the given name. It waits until the system starts the screen, then returns. Specify shell, i.e. "bash"
+func New(ctx context.Context, name string, shell string) (s Screen, err error) {
 	// Check for existing screen
 	if _, err = Get(name); !os.IsNotExist(err) {
+		err = &os.SyscallError{Syscall: os.ErrExist.Error(), Err: errors.New("screen already exists")}
 		return
 	}
 
-	// Prematurely create/get and lock mutex
-	m, _ := mutexes.LoadOrStore(name, new(sync.Mutex))
-	mutex, _ := m.(*sync.Mutex)
-	mutex.Lock()
-	defer mutex.Unlock()
-
 	// Create new screen with name
 	var out []byte
-	out, err = exec.Command(screenExec, "-dmS", name).CombinedOutput()
+	out, err = exec.Command(screenExec, "-dmS", name, shell).CombinedOutput()
 	if err != nil {
 		err = errors.New(string(out))
 		return
 	}
 
 	// Wait for screen to come up
-	waiting := make(chan (struct{}))
-	go func() {
-		for {
-			time.Sleep(time.Millisecond * 100)
-
-			s, err = Get(name)
-			switch err {
-			case os.ErrNotExist:
-				continue
-			default:
-				return
-			case nil:
-				waiting <- struct{}{}
-				break
-			}
+	for {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return
 		}
-	}()
 
-	select {
-	case <-ctx.Done():
-		err = ctx.Err()
-		return
-	case <-waiting:
-		return
+		time.Sleep(time.Millisecond * 100)
+
+		s, err = Get(name)
+		if !os.IsNotExist(err) {
+			break
+		}
 	}
+
+	return
 }
 
 // Get will retrieve an existing screen, and return a Screen struct. If no screen is found, ErrNotExist type is returned.
@@ -112,17 +98,31 @@ func Get(name string) (s Screen, err error) {
 		return
 	}
 
-	// Parse pid and name
-	secondLine := strings.Split(string(out), "\n")[1] // Screen will always be on second line
-	subject := strings.Fields(secondLine)[0]          // First part will be "<PID>.mcscreen-<name>"
-	nameAndPID := strings.Split(subject, ".")         // Dissect
-	s.Name = strings.TrimPrefix(nameAndPID[1], "mcscreen-")
-	if i, err := strconv.Atoi(nameAndPID[0]); err == nil {
-		s.Process, _ = os.FindProcess(i)
+	r, _ := regexp.Compile(fmt.Sprintf("\\s(\\d+)\\.(%s)\\s", name))
+	matches := r.FindAllStringSubmatch(string(out), -1)
+
+	// Check all lines
+	for _, match := range matches { // We want to skip first and last lines
+		// Parse pid and name
+		if match[2] != name {
+			continue
+		}
+
+		s.Name = name
+		if i, err := strconv.Atoi(match[1]); err == nil {
+			s.Process, _ = os.FindProcess(i)
+		}
+		break
+	}
+
+	if s.Name == "" {
+		err = os.ErrNotExist
+		return
 	}
 
 	// Load mutex from global map.
-	m, _ := mutexes.LoadOrStore(name, new(sync.Mutex))
+	newM := new(sync.Mutex)
+	m, _ := mutexes.LoadOrStore(name, newM)
 	mutex, _ := m.(*sync.Mutex)
 	s.Mutex = mutex
 
@@ -131,14 +131,14 @@ func Get(name string) (s Screen, err error) {
 
 // GetAll returns all existing screens.
 func GetAll() (res []Screen) {
-	out, _ := exec.Command("screen", "-ls", "mcscreen-").CombinedOutput() // Run screen list
+	out, _ := exec.Command("screen", "-ls").CombinedOutput() // Run screen list
 	if strings.Contains(string(out), "No Sockets found in") {
 		return nil
 	}
 
 	parsed := strings.Split(string(out), "\n")
 	for i := 1; i < len(parsed)-1; i++ { // We want to skip first and last lines
-		subject := strings.Fields(parsed[i])[0]   // First part will be "<PID>.mcscreen-<name>"
+		subject := strings.Fields(parsed[i])[0]   // First part will be "<PID>.<name>"
 		nameAndPID := strings.Split(subject, ".") // Dissect
 
 		var s Screen
@@ -162,8 +162,7 @@ func GetAll() (res []Screen) {
 // ================== Builtin functions ====================
 // =========================================================
 
-// Quit will stop the screen.
-func (s Screen) Quit() error {
+func (s Screen) builtinTemplate(command string) error {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 
@@ -171,41 +170,49 @@ func (s Screen) Quit() error {
 		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
 	}
 
-	// Add newline to end of commands, "enter"
-	out, err := exec.Command(screenExec, "-S", s.Name, "-X", "quit").CombinedOutput()
+	out, err := exec.Command(screenExec, "-S", s.Name, "-X", command).CombinedOutput()
 	if err != nil {
 		return errors.New(string(out))
 	}
 
 	return nil
+}
+
+func (s Screen) builtinTemplateArgs(command string, args ...string) error {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+
+	if !s.isOnline() {
+		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
+	}
+
+	out, err := exec.Command(screenExec, "-S", s.Name, "-X", command, strings.Join(args, " ")).Output()
+	if err != nil {
+		return errors.New(string(out) + err.Error()) // TODO something better
+	}
+
+	return nil
+}
+
+// Quit will stop the screen.
+func (s Screen) Quit() error {
+	return s.builtinTemplate("quit")
+}
+
+// Kill a screen.
+func (s Screen) Kill() error {
+	return s.builtinTemplate("kill")
 }
 
 // Stuff will paste the given text inside stdin for the screen. You might also want to append "\n" to "Enter" the text.
 func (s Screen) Stuff(commands ...string) error {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-
-	if !s.isOnline() {
-		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
-	}
-
-	// Add newline to end of commands, "enter"
-	out, err := exec.Command(screenExec, "-S", s.Name, "-X", "stuff", strings.Join(commands, " ")).CombinedOutput()
-	if err != nil {
-		return errors.New(string(out))
-	}
-
-	return nil
+	return s.builtinTemplateArgs("stuff", commands...)
 }
 
-// Chdir will move the screens directory.
+// Chdir will move the screens directory. // TODO FIX
 func (s Screen) Chdir(path string) error {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
-
-	if !s.isOnline() {
-		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
-	}
 
 	// Check path
 	if _, err := os.Stat(path); err != nil {
@@ -232,7 +239,6 @@ func (s Screen) Exec(fdpat string, command string, args ...string) error {
 
 	// Check fdpat
 	if fdpat == "" {
-		fdpat = ":::"
 	} else if match, err := regexp.MatchString("/[.!:]{0,3}\\|?$", fdpat); err != nil {
 		return err
 	} else if !match {
@@ -317,19 +323,7 @@ func (s Screen) Log(path string, append bool, flushInterval uint) error {
 
 // Clear erases the screen's scrollback buffer.
 func (s Screen) Clear() error {
-	s.Mutex.Lock()
-	defer s.Mutex.Unlock()
-
-	if !s.isOnline() {
-		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
-	}
-
-	out, err := exec.Command(screenExec, "-S", s.Name, "-X", "clear").CombinedOutput()
-	if err != nil {
-		return errors.New(string(out))
-	}
-
-	return nil
+	return s.builtinTemplate("clear")
 }
 
 // =========================================================
@@ -342,19 +336,43 @@ func (s Screen) Signal(signal syscall.Signal) error {
 	defer s.Mutex.Unlock()
 
 	if !s.isOnline() {
-		return &os.SyscallError{Syscall: os.ErrNotExist.Error(), Err: errors.New("screen not found")}
+		return os.ErrNotExist
 	}
 
-	// Get session ID
-	out, err := exec.Command("ps", "--no-headers", "-p", strconv.Itoa(s.Process.Pid), "-o", "sess:1").CombinedOutput()
-	if err != nil {
-		return err
-	}
+	// Traverse PPID tree
+	var subProcs []string // PIDs for subprocesses
+	var recurse func(pid string)
+	recurse = func(pid string) {
+		// Find proc with pid as PPID, print its PID
+		out, err := exec.Command("ps", "--no-headers", "--ppid", pid, "-o", "pid:1").CombinedOutput()
+		if err != nil || len(out) == 0 || len(out) == 1 {
+			return
+		}
 
-	// Walk and kill all processes that share session ID
-	out, err = exec.Command("pkill", "-s", string(out), ("-" + signal.String())).CombinedOutput()
-	if err != nil && len(out) > 0 {
-		return err
+		// Append non-empty PIDs
+		children := strings.Split(string(out), "\n")
+		for _, el := range children {
+			if strings.TrimSpace(el) != "" {
+				subProcs = append(subProcs, el)
+			}
+		}
+
+		// Tail recurse using our child PIDs
+		for _, el := range children {
+			recurse(el)
+		}
+	}
+	recurse(strconv.Itoa(s.Process.Pid))
+	// Get pseudo terminal ID
+	//cmd := exec.Command("ps", "--no-headers", "-p", strconv.Itoa(s.Process.Pid), "-o", "tty:1")
+
+	// Kill all processes that pseudo terminal
+	sig := strconv.Itoa(int(signal))
+	for _, proc := range subProcs {
+		out, err := exec.Command("kill", strings.TrimSpace(proc), ("-" + sig)).CombinedOutput()
+		if err != nil && len(out) > 0 {
+			return errors.New(string(out))
+		}
 	}
 
 	return nil
@@ -430,6 +448,6 @@ func (s Screen) StuffReturnGetOutput(ctx context.Context, commands ...string) (s
 
 // isOnline is a quick helper function to check if a screen is still currently running.
 func (s Screen) isOnline() bool {
-	_, err := New(context.Background(), s.Name)
+	s, err := Get(s.Name)
 	return err == nil
 }
